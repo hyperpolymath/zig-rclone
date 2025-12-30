@@ -1,0 +1,206 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+= zig-rclone
+:toc:
+
+image:https://img.shields.io/badge/RSR-Bronze-cd7f32[RSR Bronze]
+image:https://img.shields.io/badge/Language-Zig-f7a41d[Zig]
+
+Zig FFI bindings to librclone for cloud storage operations.
+
+== Goal
+
+Provide **direct library access** to rclone without:
+
+1. Spawning `rclone` subprocess
+2. Parsing CLI output
+3. Managing rclone daemon lifecycle
+
+Enable embedded cloud storage in Zig applications.
+
+== Methodology
+
+=== Why librclone?
+
+rclone exposes a C-compatible library (`librclone.so`) that provides:
+
+* All remote backends (40+ cloud providers)
+* VFS operations (read/write/list)
+* Sync/copy operations
+* Mount capabilities
+
+**Key insight**: rclone is Go, but exports C ABI via cgo.
+
+=== Architecture
+
+[source]
+----
+┌─────────────────────────────────────────┐
+│            zig-rclone                   │
+│         (idiomatic Zig API)             │
+├─────────────────────────────────────────┤
+│  Remote operations                      │
+│  - list, read, write, delete            │
+│  - sync, copy, move                     │
+│  VFS mount                              │
+│  - mount/unmount                        │
+│  - cache configuration                  │
+│  Config management                      │
+│  - OAuth flow handling                  │
+│  - Rate limit configuration             │
+├─────────────────────────────────────────┤
+│  src/c.zig (@cImport)                   │
+│  - librclone.h bindings                 │
+│  - JSON-RPC command interface           │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│        librclone.so (Go→C)              │
+│  - All 40+ backends                     │
+│  - VFS layer                            │
+│  - OAuth handling                       │
+└─────────────────────────────────────────┘
+----
+
+== Implementation
+
+=== Directory Structure
+
+[source]
+----
+zig-rclone/
+├── src/
+│   ├── main.zig          # Library root
+│   ├── c.zig             # @cImport for librclone.h
+│   ├── remote.zig        # Remote operations
+│   ├── vfs.zig           # VFS mount/cache
+│   ├── config.zig        # Config management
+│   └── rate_limit.zig    # Dropbox-safe defaults
+├── build.zig
+├── build.zig.zon
+└── examples/
+    ├── list.zig          # List remote files
+    ├── sync.zig          # Sync directories
+    └── mount.zig         # VFS mount
+----
+
+=== librclone C Interface
+
+rclone's librclone uses JSON-RPC over C strings:
+
+[source,c]
+----
+// librclone.h
+struct RcloneRPCResult {
+    char *Output;
+    int Status;
+};
+
+extern struct RcloneRPCResult RcloneRPC(char *method, char *input);
+extern void RcloneInitialize();
+extern void RcloneFinalize();
+----
+
+=== Zig Wrapper
+
+[source,zig]
+----
+const rclone = @import("zig-rclone");
+
+pub fn main() !void {
+    // Initialize rclone runtime
+    try rclone.init();
+    defer rclone.deinit();
+
+    // Create remote handle
+    var remote = try rclone.Remote.open("dropbox:");
+    defer remote.close();
+
+    // List with rate limiting (Dropbox-safe defaults)
+    var iter = try remote.list("/", .{
+        .tps_limit = 4,
+        .tps_burst = 1,
+    });
+    defer iter.deinit();
+
+    while (try iter.next()) |entry| {
+        std.debug.print("{s} ({d} bytes)\n", .{ entry.name, entry.size });
+    }
+}
+
+// VFS mount example
+pub fn mountExample() !void {
+    var mount = try rclone.Vfs.mount("dropbox:", "/mnt/dropbox", .{
+        .cache_mode = .writes,  // default for rate limit safety
+        .read_chunk_size = 32 * 1024 * 1024,
+        .cache_max_age = 72 * std.time.ns_per_hour,
+    });
+    defer mount.unmount();
+
+    // Mount is active, use filesystem normally
+}
+----
+
+=== Rate Limit Defaults (Dropbox-Safe)
+
+[source,zig]
+----
+pub const DropboxSafeDefaults = struct {
+    tps_limit: u32 = 4,
+    tps_burst: u32 = 1,
+    cache_mode: CacheMode = .writes,
+    read_chunk_size: usize = 32 * 1024 * 1024,
+};
+----
+
+== Platform Support
+
+[cols="1,1,2"]
+|===
+|Platform |Status |Notes
+
+|Linux |✓ Full |All features including FUSE mount
+|macOS |✓ Full |macFUSE required for mounts
+|FreeBSD |✓ Full |fusefs-libs required
+|Windows |Partial |No FUSE, remote ops only
+|Android |Partial |No mounts, remote ops only
+|===
+
+== Integration with laminar
+
+[source,zig]
+----
+// zig-rclone can replace laminar's rclone CLI calls
+const rclone = @import("zig-rclone");
+
+// Stream between clouds without temp files
+pub fn streamTransfer(src: []const u8, dst: []const u8) !void {
+    var reader = try rclone.Remote.openRead(src);
+    defer reader.close();
+
+    var writer = try rclone.Remote.openWrite(dst);
+    defer writer.close();
+
+    // Stream with backpressure
+    try rclone.stream(reader, writer, .{
+        .buffer_size = 64 * 1024 * 1024,
+        .parallel_streams = 32,
+    });
+}
+----
+
+== Dependencies
+
+Requires librclone.so from rclone build:
+
+[source,bash]
+----
+# Build librclone
+git clone https://github.com/rclone/rclone
+cd rclone
+go build -buildmode=c-shared -o librclone.so github.com/rclone/rclone/librclone
+----
+
+== License
+
+AGPL-3.0-or-later
